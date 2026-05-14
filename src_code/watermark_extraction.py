@@ -28,113 +28,47 @@ def smooth_watermark(img, kernel_size=5, sigma=5.0):
     smoothed_img = cv2.GaussianBlur(img, (kernel_size, kernel_size), sigma)
     return smoothed_img
     
-def watermark_extraction_process(original_cover_path, watermarked_image_path, original_watermark_path, scaling_factor, arnold_iterations=1):
-    # Load images
-    I_O = cv2.imread(original_cover_path)
-    if I_O is None:
-        raise FileNotFoundError(f"Original cover image not found: {original_cover_path}")
-    I_W = cv2.imread(watermarked_image_path)
-    if I_W is None:
-        raise FileNotFoundError(f"Watermarked image not found: {watermarked_image_path}")
-    
-    # --- GET ORIGINAL WATERMARK SHAPE FROM THE IMAGE FILE ---
-    watermark_original = cv2.imread(original_watermark_path, cv2.IMREAD_GRAYSCALE) #Carrega a imagem da marca em tons de cinza
-    if watermark_original is None:
-        raise FileNotFoundError(f"Original watermark image not found: {original_watermark_path}")
+def extract_frequency_tensor(image_path, block_size=8):
 
-    #Pega o tamanho da imagem da marca original    
-    original_watermark_shape = watermark_original.shape
-    original_h, original_w = original_watermark_shape
-    # --- END ---
+    img = cv2.imread(image_path)
 
-    block_size = 8 # tamanho dos blocos de aplicação do DCT
+    channels = cv2.split(img)
 
-    # Separate images into B, G, R components and perform DCT
-    B_O, G_O, R_O = cv2.split(I_O) # Imagem original
-    B_W, G_W, R_W = cv2.split(I_W) # Imagem marcada
+    features = []
 
-    # Aplicando DCT nos canais das duas imagens
-    R_O_DCT = block_dct2d(R_O.astype(np.float32), block_size)
-    G_O_DCT = block_dct2d(G_O.astype(np.float32), block_size)
-    B_O_DCT = block_dct2d(B_O.astype(np.float32), block_size)
-    R_W_DCT = block_dct2d(R_W.astype(np.float32), block_size)
-    G_W_DCT = block_dct2d(G_W.astype(np.float32), block_size)
-    B_W_DCT = block_dct2d(B_W.astype(np.float32), block_size)
+    for ch in channels:
 
-    # Aplicando DWT nos resultados de DCT
-    # Perform DWT on the DCT transformed color components
-    coeffs_R_O_DCT_DWT = pywt.dwt2(R_O_DCT, 'haar') 
-    coeffs_G_O_DCT_DWT = pywt.dwt2(G_O_DCT, 'haar')
-    coeffs_B_O_DCT_DWT = pywt.dwt2(B_O_DCT, 'haar')
-    coeffs_R_W_DCT_DWT = pywt.dwt2(R_W_DCT, 'haar')
-    coeffs_G_W_DCT_DWT = pywt.dwt2(G_W_DCT, 'haar')
-    coeffs_B_W_DCT_DWT = pywt.dwt2(B_W_DCT, 'haar')
+        # DCT
+        dct_img = block_dct2d(
+            ch.astype(np.float32),
+            block_size
+        )
 
-    # -- ATÉ AQUI AS IMAGENS ORIGINAIS E MARCADAS SEPARADAS POR CANAIS, ESTÃO TRANFORMADAS PARA O DOMINIO DA FREQUÊNCIA --------
+        # DWT
+        cA, (cH, cV, cD) = pywt.dwt2(
+            dct_img,
+            'haar'
+        )
 
-    def extract_channel_watermark(coeffs_O, coeffs_W, scaling_factor, original_watermark_shape, block_size=8):
-        # pega as 4 bandas da DWT: LL, LH, HL, HH
-        cA_O, (cH_O, cV_O, cD_O) = coeffs_O
-        cA_W, (cH_W, cV_W, cD_W) = coeffs_W
+        features.extend([
+            cA, cH, cV, cD
+        ])
 
-        # Extract the watermark DCT coefficients (inverting embedding formula)
-        W_A = (cA_W - cA_O) / scaling_factor 
-        W_H = (cH_W - cH_O) / scaling_factor
-        W_V = (cV_W - cV_O) / scaling_factor
-        W_D = (cD_W - cD_O) / scaling_factor
+    # [12, H, W]
+    features = np.stack(features,
+                        axis=0)
 
-        # 'Cria uma imagem vazia do tamanho da imagem original da marca
-        # Resize all components to original watermark size using frequency-domain alignment
-        target_h, target_w = original_watermark_shape #
-        recon_h, recon_w = target_h, target_w
-        W_ext_DCT = np.zeros((recon_h, recon_w), dtype=np.float32)
+    # normalize
+    features = (
+        features - features.mean()
+    ) / (
+        features.std() + 1e-8
+    )
 
-        # Use DCT-based resizing (frequency-domain alignment)
-        def dct_resize(block, out_shape):
-            # 1. Perform full DCT
-            block_dct = dct(dct(block.T, norm='ortho').T, norm='ortho')
-            # 2. Zero-pad or crop in frequency domain
-            h_out, w_out = out_shape
-            h_in, w_in = block_dct.shape
-            resized_dct = np.zeros((h_out, w_out), dtype=np.float32)
-            h_min = min(h_in, h_out)
-            w_min = min(w_in, w_out)
-            resized_dct[:h_min, :w_min] = block_dct[:h_min, :w_min]
-            # 3. Inverse DCT
-            resized_block = idct(idct(resized_dct.T, norm='ortho').T, norm='ortho')
-            return resized_block
-
-        mid_h, mid_w = recon_h // 2, recon_w // 2 # Define o centro da imagem da marca
-        W_ext_DCT[:mid_h, :mid_w] = dct_resize(W_A, (mid_h, mid_w))
-        W_ext_DCT[:mid_h, mid_w:] = dct_resize(W_H, (mid_h, recon_w - mid_w))
-        W_ext_DCT[mid_h:, :mid_w] = dct_resize(W_V, (recon_h - mid_h, mid_w))
-        W_ext_DCT[mid_h:, mid_w:] = dct_resize(W_D, (recon_h - mid_h, recon_w - mid_w))
-
-        # Invert block-wise DCT
-        W_ext = block_idct2d(W_ext_DCT, block_size)
-        return W_ext
-
-    
-    # Extract watermark from each channel using the helper function
-    W_R_ext = extract_channel_watermark(coeffs_R_O_DCT_DWT, coeffs_R_W_DCT_DWT, scaling_factor, original_watermark_shape)
-    W_G_ext = extract_channel_watermark(coeffs_G_O_DCT_DWT, coeffs_G_W_DCT_DWT, scaling_factor, original_watermark_shape)
-    W_B_ext = extract_channel_watermark(coeffs_B_O_DCT_DWT, coeffs_B_W_DCT_DWT, scaling_factor, original_watermark_shape)
-
-    # Average the three extracted channels to get a single, combined result
-    W_ext_combined = (W_R_ext + W_G_ext + W_B_ext) / 3.0
-
-    # Normalize and binarize the single-channel combined result
-    W_norm = cv2.normalize(W_ext_combined, None, 0, 255, cv2.NORM_MINMAX)
-    W_norm_uint8 = W_norm.astype(np.uint8)
-    
-    # Use the threshold you found to be effective, e.g., 99
-    _, W_binary = cv2.threshold(W_norm_uint8, 128, 255, cv2.THRESH_BINARY)
-    
-    # Apply inverse Arnold transform to the clean binary watermark
-    extracted_watermark = inverse_arnold_transform(W_binary, original_watermark_shape, arnold_iterations)
-    #extracted_watermark = smooth_watermark(extracted_watermark)
-
-    return extracted_watermark
+    return torch.tensor(
+        features,
+        dtype=torch.float32
+    )
 
 
 def main():
