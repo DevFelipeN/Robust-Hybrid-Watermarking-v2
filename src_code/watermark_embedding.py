@@ -38,18 +38,12 @@ def arnold_transform(image,iterations=1):
         image = transformed_image.copy()
     return transformed_image
 
-
 def covert_to_binary(image_gray,threshold=128):
     #converts a grayscale image to a binary image
     _, binary_img = cv2.threshold(image_gray, 128, 255, cv2.THRESH_BINARY)
     
     return binary_img
-'''
-def covert_to_binary(image_gray,threshold=128):
-    #converts a grayscale image to a binary image
 
-    return (image_gray>threshold).astype(np.uint8)
-'''
 def block_dct2d(image, block_size=8):
     h, w = image.shape
     dct_coeffs = np.zeros_like(image, dtype=np.float32)
@@ -75,32 +69,43 @@ def block_idct2d(dct_coeffs, block_size=8):
             image_reconstructed[i:min(i+block_size, h), j:min(j+block_size, w)] = idct_block[:block.shape[0], :block.shape[1]]
     return image_reconstructed
 
+def watermark_embedding_tensor(
+    image_tensor,
+    watermark_image,
+    scaling_factor,
+    arnold_iterations=15,
+    return_embedded=False
+):
+    # ==========================
+    # tensor RGB -> numpy uint8
+    # ==========================
+    I_O = (
+        image_tensor
+        .permute(1,2,0)
+        .detach()
+        .cpu()
+        .numpy()
+    )
 
-def embed_watermark_dwt(dwt_coeffs_original, watermark_sub_block, scaling_factor):
-    cA, (cH,cV,cD) = dwt_coeffs_original
-    if cA.shape != watermark_sub_block.shape:
-        print(f"WARNINIG: DWT cA shape {cA.shape} and watermark sub-block shape {watermark_sub_block.shape} mismatch. Resizing watermak.")
-        watermark_sub_block_resized = cv2.resize(watermark_sub_block.astype(np.float32), (cA.shape[1], cA.shape[0]), interpolation=cv2.INTER_LINEAR)
-    else:
-        watermark_sub_block_resized = watermark_sub_block.astype(np.float32)
+    if I_O.max() <= 1.0:
+        I_O = I_O * 255
 
-    #additive embedding
-    watermarked_cA = cA + scaling_factor * watermark_sub_block_resized
+    I_O = I_O.astype(np.uint8)
 
-    # Reconstruct the DWT coefficients with the watermarked cA
-    watermarked_dwt_coeffs = (watermarked_cA, (cH, cV, cD))
-    return watermarked_dwt_coeffs
+    # RGB -> BGR (OpenCV)
+    I_O = cv2.cvtColor(
+        I_O,
+        cv2.COLOR_RGB2BGR
+    )
 
-def watermark_embedding_process(cover_image_path,watermark_image_path,scaling_factor,output_path,arnold_iterations=1):
-    #load image cover
-    I_O = cv2.imread(cover_image_path)
-    if I_O is None:
-        raise FileNotFoundError(f"Watermark image not found: {watermark_image_path}")
+    W = watermark_image.squeeze(
+        0
+    ).cpu().numpy()
 
-    #load image watermark
-    W = cv2.imread(watermark_image_path,cv2.IMREAD_GRAYSCALE)
-    if W is None:
-        raise FileNotFoundError(f"Watermark image not found: {watermark_image_path}")
+    if W.max() <= 1:
+        W = W * 255
+
+    W = W.astype(np.uint8)
 
     #separating the cover image into R, G and B color components with DCT transforms
     B,G,R = cv2.split(I_O)
@@ -124,12 +129,6 @@ def watermark_embedding_process(cover_image_path,watermark_image_path,scaling_fa
         W_resized = cv2.resize(W,(w_size,w_size),interpolation=cv2.INTER_AREA)
     else:
         W_resized = W.copy()
-
-    #Salva a imagem da marca binarizada 
-    watermarkpath = f"{output_path}/embed_watermark.png"
-    os.makedirs(os.path.dirname(watermarkpath), exist_ok=True)
-    binary = covert_to_binary(W_resized)
-    cv2.imwrite(watermarkpath, binary)
 
     # Embaralha a imagem da marca
     W_scrambled = arnold_transform(W_resized,arnold_iterations)
@@ -195,7 +194,7 @@ def watermark_embedding_process(cover_image_path,watermark_image_path,scaling_fa
     #embed the W_G_DCT
     h_wr, w_wr = W_G_DCT.shape #dividing into sub-blocks
     cA_G_shape = coeff_G_DCT_DWT[0].shape
-    W_G_DCT_resized = cv2.resize(W_G_DCT, (cA_G_shape[1] * 2, cA_R_shape[0] * 2), interpolation=cv2.INTER_LINEAR)
+    W_G_DCT_resized = cv2.resize(W_G_DCT, (cA_G_shape[1] * 2, cA_G_shape[0] * 2), interpolation=cv2.INTER_LINEAR)
     mid_h, mid_w = W_G_DCT_resized.shape[0] // 2, W_G_DCT_resized.shape[1] // 2
     W_GA = W_G_DCT_resized[0:mid_h, 0:mid_w]
     W_GB = W_G_DCT_resized[0:mid_h, mid_w:]
@@ -260,55 +259,37 @@ def watermark_embedding_process(cover_image_path,watermark_image_path,scaling_fa
     
     I_W = cv2.merge([I_B_W, I_G_W, I_R_W]) # Merge in BGR order for OpenCV display/save
 
-    return I_W
+    # BGR -> RGB
+    I_W = cv2.cvtColor(
+        I_W,
+        cv2.COLOR_BGR2RGB
+    )
 
+    I_W = torch.from_numpy(
+        I_W
+    ).permute(
+        2,0,1
+    ).contiguous()
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--cover", required=True)
-    parser.add_argument("--watermark", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--scaling_factor", type=float, required=True)
-    parser.add_argument("--arnold_iterations", type=int, required=True)
+    I_W = (
+        I_W.float()
+        / 255.
+    )
 
-    args = parser.parse_args()
+    embedded_watermark = (
+        torch.from_numpy(
+            W_binary
+        )
+        .unsqueeze(0)
+        .float()
+        / 255.
+    )
 
-    cover_image_path = args.cover
-    watermark_image_path = args.watermark
-    output_path = args.output
-    scaling_factor = args.scaling_factor
-    arnold_iterations = args.arnold_iterations
+    if return_embedded:
 
-    try:
-        watermarked_image = watermark_embedding_process(
-            cover_image_path,
-            watermark_image_path,
-            scaling_factor,
-            output_path,
-            arnold_iterations
+        return (
+            I_W,
+            embedded_watermark
         )
 
-        watermarked_path = f"{output_path}/watermarked.png"
-        os.makedirs(os.path.dirname(watermarked_path), exist_ok=True)
-        cv2.imwrite(watermarked_path, watermarked_image) 
-        print(f"Watermark embedding complete. Saved to {watermarked_path}")
-
-        cover = cv2.imread(cover_image_path)
-        watermark = cv2.imread(watermark_image_path, cv2.IMREAD_GRAYSCALE)
-
-        psnr_value = cv2.PSNR(cover, watermarked_image)
-
-        cover_gray = cv2.cvtColor(cover, cv2.COLOR_BGR2GRAY)
-        watermarked_gray = cv2.cvtColor(watermarked_image, cv2.COLOR_BGR2GRAY)
-        ssim_value, _ = ssim(cover_gray, watermarked_gray, full=True)
-
-        print(f"PSNR: {psnr_value:.2f} dB")
-        print(f"SSIM: {ssim_value:.4f}")
-
-        cv2.imwrite("output_preview.png", watermarked_image)
-
-    except Exception as e:
-        print(f"An error occurred: {e}")
-
-if __name__ == "__main__":
-    main()
+    return I_W
